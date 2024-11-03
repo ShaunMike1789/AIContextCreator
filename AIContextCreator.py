@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Comprehensive Code Collector CLI Tool
 
@@ -21,15 +20,11 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import datetime
-
-import yaml
-from tqdm import tqdm
-from git import Repo
-from radon.complexity import cc_visit
+from tqdm import tqdm  # Added explicit import from tqdm
+from git import Repo   # Added explicit import from GitPython
+from radon.raw import analyze as radon_raw_analyze  # Added explicit radon imports
 from radon.metrics import mi_visit
-from radon.raw import analyze as radon_raw_analyze
-import tkinter as tk
-from tkinter import filedialog
+from radon.complexity import cc_visit
 
 # Initialize logging
 logger = logging.getLogger(__name__)
@@ -40,11 +35,12 @@ PROGRAMMING_EXTENSIONS = [
     '.py', '.ipynb', '.js', '.jsx', '.ts', '.tsx', '.html', '.css', '.java', '.c', '.cpp', '.h',
     '.cs', '.rb', '.php', '.go', '.rs', '.swift', '.kt', '.scala', '.pl', '.lua', '.r', '.sql',
     '.sh', '.bat', '.m', '.vb', '.erl', '.ex', '.clj', '.hs', '.s', '.asm', '.ps1', '.groovy',
-    '.f', '.f90', '.lisp', '.lsp', '.fs', '.ml', '.jl', '.env', '.json5', '.toml', '.xml', '.ini', '.dart'
-]# add .dart
+    '.f', '.f90', '.lisp', '.lsp', '.fs', '.ml', '.jl', '.env', '.json5', '.toml', '.xml', '.ini'
+]
 
 # Default excluded directories
-DEFAULT_EXCLUDE_DIRS = {'.git', 'node_modules', '__pycache__', 'dist', 'venv'} # add venv
+DEFAULT_EXCLUDE_DIRS = {'.git', '.vi', '.idea', '.vscode', 'obj', 'staticfiles',  
+    'env', 'venv', 'node_modules', '__pycache__', 'dist'}
 
 # Supported output formats
 OUTPUT_FORMATS = ['markdown', 'json', 'text']
@@ -72,10 +68,10 @@ ENV_SECRET_VARIABLE_PATTERN = re.compile(r'^(?P<var>.*(?:KEY|SECRET|PASSWORD|TOK
 
 def check_required_packages():
     try:
-        import radon
-        import yaml
+        from ruamel.yaml import YAML  # Changed from 'import yaml' to import from ruamel.yaml
         import tqdm
         import git
+        import radon
     except ImportError as e:
         logger.error(f"Required package not found: {e}")
         logger.error("Please install all required packages: pip install -r requirements.txt")
@@ -84,17 +80,42 @@ def check_required_packages():
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load configuration from a YAML or JSON file."""
     try:
-        with open(config_path, 'r') as f:
-            if config_path.endswith(('.yaml', '.yml')):
-                return yaml.safe_load(f)
-            elif config_path.endswith('.json'):
+        if config_path.endswith(('.yaml', '.yml')):
+            try:
+                from ruamel.yaml import YAML
+                yaml = YAML(typ='safe')
+                with open(config_path, 'r') as f:
+                    return yaml.load(f)
+            except ImportError:
+                import json
+                logger.warning("YAML support not available, falling back to JSON")
+                with open(config_path, 'r') as f:
+                    return json.load(f)
+        elif config_path.endswith('.json'):
+            with open(config_path, 'r') as f:
                 return json.load(f)
     except Exception as e:
         logger.error(f"Failed to load config file {config_path}: {e}")
     return {}
 
-def is_programming_file(file_path: Path, include_ext: List[str], exclude_ext: List[str]) -> bool:
-    """Determine if a file is a programming file based on its extension."""
+def is_programming_file(file_path: Path, include_ext: List[str], exclude_ext: List[str], exclude_files: List[str] = None) -> bool:
+    """
+    Determine if a file is a programming file based on its extension and exclusion lists.
+    
+    Args:
+        file_path: Path object of the file
+        include_ext: List of extensions to include
+        exclude_ext: List of extensions to exclude
+        exclude_files: List of specific filenames or patterns to exclude
+    """
+    # Check if file matches any exclude pattern
+    if exclude_files:
+        for pattern in exclude_files:
+            # Convert glob pattern to regex pattern
+            regex_pattern = pattern.replace('.', '\.').replace('*', '.*')
+            if re.match(regex_pattern, file_path.name, re.IGNORECASE):
+                return False
+    
     ext = file_path.suffix.lower()
     return ext in include_ext and ext not in exclude_ext
 
@@ -163,26 +184,83 @@ def format_code(code: str, file_type: str) -> str:
         logger.error(f"Formatting failed for {file_type}: {e}")
     return code
 
-def generate_tree(root_path: Path, exclude_dirs: set, prefix: str = '', is_last: bool = True) -> str:
-    """Recursively generate a tree structure string for the given root_path."""
+def generate_tree(root_path: Path, config: Dict[str, Any], prefix: str = '', is_last: bool = True) -> str:
+    """
+    Recursively generate a tree structure string for the given root_path, showing file statistics.
+    
+    Args:
+        root_path: Path object of the directory to process
+        config: Configuration dictionary containing filters
+        prefix: Prefix for the current line (used for recursion)
+        is_last: Whether this is the last item in its level
+    """
     tree_str = ''
     try:
-        contents = sorted(
-            [p for p in root_path.iterdir() if (p.is_dir() and p.name not in exclude_dirs) or p.is_file()],
+        # Get all files and directories
+        all_items = sorted(
+            [p for p in root_path.iterdir()],
             key=lambda p: (not p.is_dir(), p.name.lower())
         )
 
+        # Filter items based on config
+        filtered_items = []
+        for item in all_items:
+            # Skip excluded directories
+            if item.is_dir():
+                if item.name in config.get('exclude_dirs', DEFAULT_EXCLUDE_DIRS):
+                    continue
+                if config.get('include_dirs'):
+                    if item.name in config.get('include_dirs', []):
+                        filtered_items.append(item)
+                else:
+                    has_matching_files = any(
+                        is_programming_file(
+                            p,
+                            config.get('include_extensions', PROGRAMMING_EXTENSIONS),
+                            config.get('exclude_extensions', []),
+                            config.get('exclude_files', [])
+                        )
+                        for p in item.rglob('*')
+                        if p.is_file()
+                    )
+                    if has_matching_files:
+                        filtered_items.append(item)
+            else:
+                if is_programming_file(
+                    item,
+                    config.get('include_extensions', PROGRAMMING_EXTENSIONS),
+                    config.get('exclude_extensions', []),
+                    config.get('exclude_files', [])
+                ):
+                    filtered_items.append(item)
+
+        # Generate tree structure
         pointers = ['├── ', '└── ']
-        for index, path in enumerate(contents):
-            connector = pointers[1] if index == len(contents) - 1 else pointers[0]
+        for index, path in enumerate(filtered_items):
+            connector = pointers[1] if index == len(filtered_items) - 1 else pointers[0]
             if path.is_dir():
                 tree_str += f"{prefix}{connector}{path.name}/\n"
-                extension = '    ' if index == len(contents) - 1 else '│   '
-                tree_str += generate_tree(path, exclude_dirs, prefix + extension, index == len(contents) - 1)
+                extension = '    ' if index == len(filtered_items) - 1 else '│   '
+                subtree = generate_tree(path, config, prefix + extension, index == len(filtered_items) - 1)
+                if subtree:  # Only add non-empty subtrees
+                    tree_str += subtree
             else:
-                tree_str += f"{prefix}{connector}{path.name}\n"
+                # Get file statistics
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        lines = len(content.splitlines())
+                        chars = len(content)
+                        size = path.stat().st_size
+                        stats = f"(lines: {lines}, chars: {chars}, size: {size} bytes)"
+                except Exception as e:
+                    stats = "(unable to read file)"
+                    logger.error(f"Error reading file {path}: {e}")
+                
+                tree_str += f"{prefix}{connector}{path.name} {stats}\n"
     except Exception as e:
         logger.error(f"Error generating tree for {root_path}: {e}")
+    
     return tree_str
 
 def clone_github_repo(repo_url: str, branch: str = 'main') -> Optional[Path]:
@@ -359,10 +437,18 @@ def check_security_misconfigurations(file_path: Path, content: str) -> List[str]
 
 async def collect_code_async(root_path: Path, config: Dict[str, Any]) -> Dict[str, Any]:
     """Asynchronously collect code from files based on configuration."""
+    logger.debug(f"Starting code collection from: {root_path}")
+    logger.debug(f"Configuration: {config}")
+    
     collected_data = {
-        'tree': generate_tree(root_path, config.get('exclude_dirs', DEFAULT_EXCLUDE_DIRS)),
+        'tree': generate_tree(root_path, config),  # Pass the full config to generate_tree
         'files': []
     }
+
+    # Get exclude files list from config
+    exclude_files = config.get('exclude_files', [])
+    if exclude_files and isinstance(exclude_files, str):
+        exclude_files = [f.strip() for f in exclude_files.split(',')]
 
     # Gather all relevant file paths
     file_paths = [
@@ -370,16 +456,14 @@ async def collect_code_async(root_path: Path, config: Dict[str, Any]) -> Dict[st
         if p.is_file() and is_programming_file(
             p,
             config.get('include_extensions', PROGRAMMING_EXTENSIONS),
-            config.get('exclude_extensions', [])
+            config.get('exclude_extensions', []),
+            exclude_files
         )
         and not any(excl in p.parts for excl in config.get('exclude_dirs', DEFAULT_EXCLUDE_DIRS))
         and (not config.get('include_dirs') or any(dir in p.parts for dir in config.get('include_dirs')))
     ]
 
-    # Retrieve custom patterns
-    custom_patterns = config.get('custom_secret_patterns', [])
-
-    # Initialize progress bar
+    # Rest of the function remains the same...
     for file_path in tqdm(file_paths, desc="Processing files", unit="file"):
         relative_path = file_path.relative_to(root_path)
         code = await read_file_async(file_path)
@@ -528,57 +612,54 @@ def export_to_pdf(output_file: str, markdown_file: str):
     except Exception as e:
         logger.error(f"Failed to export PDF: {e}")
 
-# Function to select a directory using a GUI dialog
-def select_directory(title="Select a Directory") -> Optional[str]:
-    """Open a dialog to select a directory and return the path."""
-    root = tk.Tk()
-    root.withdraw()  # Hide the root window
-    directory = filedialog.askdirectory(title=title)
-    return directory if directory else None
-
 def main():
     """Main function to parse arguments, load configurations, and initiate code collection."""
     parser = argparse.ArgumentParser(description="Comprehensive Code Collector CLI Tool")
-    parser.add_argument('directory', nargs='?', help='Path of the folder to traverse (leave empty for GUI folder selection)')
+    
+    # Required arguments
+    parser.add_argument('directory', help='Path of the folder to traverse')
+    
+    # Optional arguments
     parser.add_argument('-o', '--output', default='collected_code', help='Output file name without extension')
     parser.add_argument('--config', help='Path to configuration file (YAML or JSON)')
     parser.add_argument('--include-extensions', help='Comma-separated list of extensions to include (overrides config)')
     parser.add_argument('--exclude-extensions', help='Comma-separated list of extensions to exclude (overrides config)')
     parser.add_argument('--include-dirs', help='Comma-separated list of directories to include (overrides config)')
     parser.add_argument('--exclude-dirs', help='Comma-separated list of directories to exclude (overrides config)')
-    parser.add_argument('--remove-comments', action='store_true', help='Remove comments from the code (overrides config)')
-    parser.add_argument('--minify', action='store_true', help='Minify the code (overrides config)')
-    parser.add_argument('--format-code', action='store_true', help='Format code using formatters (overrides config)')
+    parser.add_argument('--exclude-files', help='Comma-separated list of specific files to exclude (overrides config)')
+    
+    # Boolean flags
+    parser.add_argument('--verbose', action='store_true', default=False, help='Enable verbose logging')
+    parser.add_argument('--remove-comments', action='store_true', default=False, help='Remove comments from the code')
+    parser.add_argument('--minify', action='store_true', default=False, help='Minify the code')
+    parser.add_argument('--format-code', action='store_true', default=False, help='Format code using formatters')
+    parser.add_argument('--extract-metrics', action='store_true', default=False, help='Extract code metrics')
+    parser.add_argument('--detect-secrets', action='store_true', default=False, help='Detect potential secrets in code')
+    parser.add_argument('--run-linter', action='store_true', default=False, help='Run linters on code files')
+    parser.add_argument('--export-pdf', action='store_true', default=False, help='Export Markdown output to PDF')
+    
+    # Options with specific choices
+    parser.add_argument('--output-format', choices=OUTPUT_FORMATS, default='markdown', help='Output format')
+    parser.add_argument('--handle-secrets', choices=['keep', 'redact', 'remove'], default='keep', 
+                       help='Handle detected secrets: keep, redact, or remove')
+    
+    # GitHub specific options
     parser.add_argument('--github', help='GitHub repository URL to clone and process')
     parser.add_argument('--branch', default='main', help='Branch to clone from GitHub repo (default: main)')
-    parser.add_argument('--output-format', choices=OUTPUT_FORMATS, default='markdown', help='Output format')
-    parser.add_argument('--export-pdf', action='store_true', help='Export Markdown output to PDF')
-    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
-    parser.add_argument('--extract-metrics', action='store_true', help='Extract code metrics (LOC, cyclomatic complexity)')
-    parser.add_argument('--detect-secrets', action='store_true', help='Detect potential secrets in code')
-    parser.add_argument('--handle-secrets', choices=['keep', 'redact', 'remove'], default='keep', help='Handle detected secrets: keep, redact, or remove')
-    parser.add_argument('--run-linter', action='store_true', help='Run linters on code files')
-    parser.add_argument('--custom-secret-patterns', help='Path to a file containing custom regex patterns for secret detection (one per line)')
+    
+    # Additional options
+    parser.add_argument('--custom-secret-patterns', help='Path to file containing custom regex patterns for secret detection')
 
     args = parser.parse_args()
 
     # Check for required packages
     check_required_packages()
 
-    # Set logging level
+    # Set logging level based on verbose flag
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-
-    # Use GUI for directory selection if directory argument is not provided
-    if not args.directory:
-        logger.info("No directory specified. Opening GUI folder selection dialog...")
-        selected_directory = select_directory()
-        if not selected_directory:
-            logger.error("No directory selected. Exiting.")
-            return
-        root_dir = Path(selected_directory)
     else:
-        root_dir = Path(args.directory)
+        logger.setLevel(logging.INFO)
 
     # Load configuration
     config = {}
@@ -586,7 +667,7 @@ def main():
         config = load_config(args.config)
         logger.debug(f"Configuration loaded from {args.config}: {config}")
 
-    # Override config with command-line arguments if provided
+    # Override config with command-line arguments
     if args.include_extensions:
         config['include_extensions'] = [ext.strip() for ext in args.include_extensions.split(',')]
     if args.exclude_extensions:
@@ -595,22 +676,19 @@ def main():
         config['include_dirs'] = [d.strip() for d in args.include_dirs.split(',')]
     if args.exclude_dirs:
         config['exclude_dirs'] = set([d.strip() for d in args.exclude_dirs.split(',')])
-    if args.remove_comments:
-        config['remove_comments'] = True
-    if args.minify:
-        config['minify'] = True
-    if args.format_code:
-        config['format_code'] = True
-    if args.extract_metrics:
-        config['extract_metrics'] = True
-    if args.detect_secrets:
-        config['detect_secrets'] = True
-    if args.handle_secrets:
-        config['handle_secrets'] = args.handle_secrets
-    if args.run_linter:
-        config['run_linter'] = True
+    if args.exclude_files:
+        config['exclude_files'] = [f.strip() for f in args.exclude_files.split(',')]
+    
+    # Add boolean flags to config
+    config['remove_comments'] = args.remove_comments
+    config['minify'] = args.minify
+    config['format_code'] = args.format_code
+    config['extract_metrics'] = args.extract_metrics
+    config['detect_secrets'] = args.detect_secrets
+    config['run_linter'] = args.run_linter
+    config['handle_secrets'] = args.handle_secrets
 
-    # Load custom secret patterns from file if provided
+    # Load custom secret patterns if provided
     if args.custom_secret_patterns:
         try:
             with open(args.custom_secret_patterns, 'r') as f:
@@ -628,6 +706,8 @@ def main():
         else:
             logger.error("Exiting due to repository cloning failure.")
             return
+    else:
+        root_dir = Path(args.directory)
 
     # Validate directory
     if not root_dir.is_dir():
